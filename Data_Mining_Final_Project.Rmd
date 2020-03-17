@@ -1,0 +1,608 @@
+---
+title: 'Project E: Detecting Network Instrusions'
+author: "Alton Lu and Nik Rebovich"
+date: "March 9th, 2018"
+output:
+  pdf_document: default
+  html_document:
+    code_folding: hide
+andrewID: altonl, nrebovic
+---
+
+# Introduction
+XYZ Bank has hired analytics consultants from Hufflepuff to develop a system that can detect and warn of anomalous network activities. These consultants are being overpaid to accomplish several key tasks that are important to XYZ Bank.
+
+Key tasks:
+
+	1. Determine if it is possible to differentiate between the labeled intrusions and benign sessions.
+	
+	2. Is it possible to identify different types of intrusions? If so, which values of which attributes in data correlate with the specific types of intrusions?
+	
+	3. Develop and implement a systematic approach to detect instances of intrusions in log files. Your system will need to be able to take a new network_traffic log file and determine the existence of known patterns of intrusions as well as anomalies which may be indicative of new and unknown intrusion patterns.
+	
+	4. Evaluate detection power of your system.
+	
+	5. Can your intrusion detector be used in real-time? It would need to be able to receive data about a current session, and in seconds determine if it is likely to be and intrusion of previously seen type or an anomaly potentially signifying an unseen yet intrusion mode. What information should be exchanged via the user interface of such system?
+
+# Data Exploration: Scope
+
+Data Size
+
+- 23 Features
+
+- 3000 Observations
+
+Feature Descriptions
+
+- 3 Nominal (protocol_type, service, flag)
+
+- 13 Continuous (src_bytes, dst_bytes, wrong fragment)
+
+- 9 Discrete (hot_login, su_attempted)
+
+- 1 Discrete Label (is_intrusion [benign or intrusion])
+
+
+The data provided by XYZ bank include various aspects of network connections through their log files. These include a total of 3000 observations and 23 variables. The difficulty with this project for the Hufflepuff consultants is domain knowledge. There is little information apparent about the definitions of the data set. Some features can be inferred, such as logged_in and is_intrusion. Other features such as su_attempted and root_shell require more domain-specific knowledge about network communications.
+
+```{r setup, include=FALSE}
+library(caret)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(knitr)
+library(klaR)
+library(plyr)
+library(gam)
+library(ranger)
+library(cluster)
+library(Rtsne)
+library(RColorBrewer)
+library(e1071)
+library(gbm)
+library(kernlab)
+
+set.seed(2459)
+
+data <- read.csv("http://www.andrew.cmu.edu/user/achoulde/95791/projects/Project%20D/network_traffic.csv")
+
+str(data)
+
+```
+
+The above data summary reflects the network activity at Bank XYZ. This data includes categorical variables in binary, 1 yes and 0 no, related to what type of network activity occured as well as numeric varaibles that measure what occurred during the network activity. Much of the categorical data has a mean at or close to zero indicating little useful data to compare intrusion activities to benign activities. We believe protocol_type, service, src_bytes, and dst_bytes will allow us to compare  characteristics that are unique in intrusions compared to benign network activity. 
+
+```{r}
+summary(data)
+```
+
+# Data Processing
+
+There were some minor data cleaning. One data point in the is_intrusion column was 0= instead of 0. We changed that to a 0. We also noticed from the original data set that XYZ bank provided us with an incorrect variable. is_host_login should be specified as is_hot_login according to industry experts in network communications and we made changed accordingly (KDD dataset lists as is_hot_login).
+
+Otherwise, the data were well-behaved and the consultants from Hufflepuff are thankful to the great data work by XYZ bank.
+
+One final step we took was to transform src_bytes and dst_bytes to log form. These had exponential increases and the transformation makes them more manageable.
+
+
+```{r}
+unique(data$is_intrusion)
+data$is_intrusion <- as.character(data$is_intrusion)
+data$is_intrusion[data$is_intrusion == "0="] <- 0
+data$is_intrusion <- as.factor(data$is_intrusion)
+
+# Giving intrusion more specific class
+levels(data$is_intrusion) <- c("benign", "intrusion")
+
+# incorrect variable name is_host_login should be is_hot_login
+names(data)[21] <- "is_hot_login"
+
+# Transform bytes data to more manageable size
+data$src_bytes <- log(data$src_bytes + 1)
+data$dst_bytes <- log(data$dst_bytes + 1)
+
+table(data$is_intrusion)
+```
+
+
+General other data exploration tasks. The table show the distribtuion of intrusions to non-intrusion events. 
+
+```{r}
+table(data$is_intrusion)
+```
+
+
+# Data Exploration Visualization
+
+```{r}
+
+Palette <- c("green4", "black")
+
+
+ggplot(data, aes(x = is_intrusion, fill = is_intrusion)) +
+  geom_histogram(stat = "count") +
+  scale_color_brewer(type = 'qual', palette = 4, name = "Event Type") + 
+  theme_bw() +
+  scale_fill_manual(values=Palette)
+
+table(data$protocol_type, data$is_intrusion)
+
+ggplot(data, aes(x = protocol_type, group = is_intrusion, fill = is_intrusion)) +
+  geom_histogram(stat = "count", position = "dodge") +
+  theme_bw() +
+  labs(x = "Protocol", y = "Intrusion Counts", title = "Intrusion by Protocol") +
+  scale_fill_manual(values=Palette)
+
+
+```
+
+Based on the protocol used there are 200 intrusions for TCP protocol representing 8% or this type of protocol. In UDP protocol intrusions make up 19.6% of data. There are no intrusions from ICMP protocol.
+
+
+```{r pressure, echo=FALSE}
+ggplot(data, aes(x = service, group = is_intrusion, fill = is_intrusion)) +
+  geom_histogram(stat = "count", position = "dodge") +
+  theme_bw() +
+  labs(x = "Service", y = "Intrusion Counts", title = "Intrusion by Service") +
+  scale_fill_manual(values=Palette)
+
+table(data$service, data$is_intrusion)
+```
+
+Intrusions make up the following percentage greater than zero based on service type(percent of total network traffic):
+
+-FTP 73.3% (1.5%)
+
+-FTP_Data 39.6% (5.6%)
+
+-HTTP 5.2% (63.7%)
+
+-Private 40.5% (8.2%)
+
+FTP, FTP Data and Private types of services are used in a high percent of network intrusions, but these types of services represent a low precentage of the total data. HTTP has a low rate of network intrusions but this is because of its high rate of use for benign connections. A model that will accurately predict network intrusions must be able to detect intrusions on both high use services such as HTTP and low use services such as FTP and private.
+
+```{r}
+ggplot(data, aes(x = protocol_type, y = service, group = is_intrusion, col = is_intrusion)) +
+  geom_point() +
+  geom_jitter() +
+  theme_bw() +
+  labs(x = "Protocol", y = "Service", title = "Intrusion by Service/Protocol") +
+  scale_colour_manual(values=Palette)
+```
+
+Comparing Protocol type to Service type reveals areas with high rates of intrusions such as UDP protocol with private service and TCP protocol with FTP service. It is hard to tell, however; if there are trends within the HTTP service because there is such a high rate of benign network uses. There is also no clear clustering of intrusion data with intrusions interspersed with benign netowrk activity.
+
+
+```{r}
+ggplot(data, aes(x = protocol_type, y = src_bytes, group = is_intrusion, col = is_intrusion)) +
+  geom_point() +
+  geom_jitter() +
+  theme_bw() +
+  labs(x = "Protocol", y = "SRC Bytes", title = "Intrusion by Protocol based on SRC Bytes") +
+  scale_colour_manual(values=Palette)
+
+```
+
+There is clear clustering when we compare protocol type to SRC Bytes. For TCP protocol there is a cluster of intrusion activity around 60,000 SRC bytes and another cluster at exactly 283,618 SRC Bytes. These clusters could indicate different types of intrusions based on their SRC characteristics.
+
+```{r}
+ggplot(data, aes(x = service, y = src_bytes, group = is_intrusion, col = is_intrusion)) +
+  geom_point() +
+  geom_jitter() +
+  theme_bw() +
+  labs(x = "Protocol", y = "SRC Bytes", title = "Intrusion by Service based on SRC Bytes") +
+  scale_colour_manual(values=Palette)
+```
+
+Exploring SRC bytes further we can see that based on the type of service there are clear clusters of intrusion data. We can see that there is a cluster around 60,000 SRC bytes for the HTTP service. For FTP Data there is a cluster at 283,618 again indicating the possbility of two types of intrusions.
+
+
+
+# Data Analysis - Validation and Methods
+
+To begin, we split our data into a train and test set. We used the traditional 70/30 split. The test set will be used as unseen data to test the power of our models. The training data is how we will select and train our model.
+
+We make extensive use of the caret package for our analysis. The caret package minimzes possible mistakes and allows easy cross validation. To begin, we specified specific folds in our 'myFolds' object to ensure each model is run on the exact same folds. This ensures that model comparisons are able to be properly compared.
+
+Just as a further check, we ensure that each fold has equal distribution of intrusions to benign data.
+
+
+```{r}
+
+### Data Splitting ----------
+set.seed(2459)
+trainIndex <- createDataPartition(data$is_intrusion, p = .7, 
+                                  list = FALSE, 
+                                  times = 1)
+
+dataTrain <- data[trainIndex,]
+dataTest <- data[-trainIndex,]
+
+dataNormal <- filter(dataTrain, is_intrusion == "benign")
+
+# Creates each separate fold. K = 10 is 10 folds
+myFolds <- createFolds(dataTrain$is_intrusion, k = 10)
+
+# A loop to ensure each fold has proper distribution of intrusions to benign.
+for(i in 1:length(myFolds)){
+  checkFolds <- as.numeric(unlist(myFolds[1]))
+  print(paste("This is Fold #", i))
+  print(table(dataTrain$is_intrusion[checkFolds]) / length(checkFolds))
+}
+
+# control object for caret's train function. Ensures proper folds.
+myControl <- trainControl(
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE, # IMPORTANT!
+  savePredictions = TRUE,
+  index = myFolds
+)
+
+```
+
+
+Data Methods:
+
+We decided to try to fit 4 models. As task 1 and 3 specified, we were to classify intrusion events from benign, thus we chose several models that do well with classification. 
+
+
+#### Gradient Boosting Model and Random Forest
+We chose two tree types, random forests and gradient boosting trees. For these trees, we implemented probability averaging in the train control. We chose trees because of their ease of use. From our previous visualizations, we know that there are common interactions (high src_bytes with a specific protocol type are commonly associated with intrusions). We want to capture these interactions, which ensemble tree methods do quite well. This is the improvement over some other simple linear model.
+
+With boosting, we went with the commonly chosen .01 for the shrinkage parameter. We chose splits at 1,3 and 5 to better compare potenetial boosting depths. 
+
+```{r, cache = TRUE, warning=FALSE}
+# Gradient Boosted Trees
+gbmFit1 <- train(is_intrusion ~ ., data = dataTrain, method = "gbm", 
+                 trControl = myControl, 
+                 metric = "ROC",
+                 preProcess = "zv",
+                 verbose = FALSE)
+
+
+# Random forest model
+rfFit1 <- train(is_intrusion ~ ., data = dataTrain, method = "ranger", 
+                trControl = myControl, metric = "ROC", verbose = FALSE)
+
+
+
+plot(gbmFit1)
+plot(rfFit1)
+```
+
+#### Boosted Logistic Regression
+To continue with boosting methods, we also used a boosted logistic regression model. Logistic regression works well with the 2-class (benign, intrusion) data that we have. The addition of boosting will aid in reducing bias and variance. We felt it would be useful to fit a logistic regression as check on the assumptions of trees. The tree models typically assume parallel boundaries that divide the feature space into rectangles. This works quite well. However, we're testing it with a linear decision boundary as well. 
+
+
+```{r, cache = TRUE, warning=FALSE}
+logFit1 <- train(is_intrusion ~ ., data = dataTrain, method = 'LogitBoost', 
+                trControl = myControl, preProcess = c("zv", "center", "scale", "pca"),
+                metric = "ROC", verbose = FALSE) 
+
+
+logFit1
+plot(logFit1)
+
+```
+
+The Boosted Log regression appears to work best with 10 boosting iterations.
+
+WE also compared the logistic fit with an LDA model
+
+
+```{r, cache = TRUE, warning=FALSE}
+ldaFit1 <- train(is_intrusion ~ ., data = dataTrain, method = "lda", 
+                trControl = myControl, preProcess = c("zv", "center", "scale", "pca"),
+                metric = "ROC", verbose = FALSE) 
+
+ldaFit1
+
+varImp(ldaFit1)
+varImp(logFit1)
+
+```
+
+The LDA model has the same variable importance as the boosted logistic regression. Our assumption would be that they perform similarly.
+
+#### Support Vector Machine
+
+```{r, cache = TRUE, warning=FALSE}
+svmFit1 <- train(is_intrusion ~., data = dataTrain, method = 'svmRadialWeights',
+               trControl = myControl, preProcess = c("zv", "center", "scale"),
+               metric = "ROC", verbose = FALSE)
+
+plot(svmFit1)
+```
+
+The best SVM model is held at sigma .05 with a cost of .5. On a weight distribution from 1 to 9, the optimal model keeps weight at 1. 
+
+#### Comparing Models
+
+```{r, cache = TRUE, warning=FALSE}
+model_compare <- list(
+  boostedTree = gbmFit1,
+  randomForest = rfFit1,
+  boostLog = logFit1,
+  linDiscrim = ldaFit1,
+  svMachine = svmFit1
+)
+
+
+results <- resamples(model_compare)
+summary(results)
+bwplot(results)
+
+```
+
+Because of the nature of the problem, we emphasize higher sensitivity, even at the expensive of accuracy and specificity. In network intrusions, a false negative is much more costly than a false positive. Therefore, when comparing models, we would prefer models with stronger sensitivity, even at the expense of specificity with false positives.
+
+Across all models though, we see that random forests and boosted logistic regression perform on average perform better than all other models. Boosted Tree and support vector machines have the high sensitivity, but it comes at the expensive of inconsistencies in specificity that are too large to be comfortable. 
+
+Our boxplot shoes that in general, the random forest and boosted log are more consistently near the top in all our classification measurements. We'll take both forward to test on the unseen 30% test data previously partitioned out. We'll also took the booted tree as it's performance is similar to random forest.
+
+#### Model Performance Metrics
+
+```{r}
+# Testing the boosted logistic regression
+logClasses <- predict(logFit1, newdata = dataTest)
+rfClasses <- predict(rfFit1, newdata = dataTest)
+gbmClasses <- predict(gbmFit1, newdata = dataTest)
+
+print("Boosted Logistic Regression Test")
+confusionMatrix(logClasses, dataTest$is_intrusion, positive = "intrusion")
+print("Random Forest Test")
+confusionMatrix(rfClasses, dataTest$is_intrusion, positive = "intrusion")
+print("Gradient Boosting")
+confusionMatrix(gbmClasses, dataTest$is_intrusion, positive = "intrusion")
+
+```
+
+With these tests, we see that boosted regression appears to perform far better. Both models have 2 false negatives. However, there is a quirk that occurs with the boosted logistic regression. It appears to be dropping observations from its predictions. We feel that the random forest is more reliable in this situation. 
+
+Boosted forest generalizes well to unseen data. It performs roughly as we would expect from training. Sensitivity is a little lower than expected, but the models performs well. We wil use this for unseen data as well.
+
+
+# Data Analysis: Identifying Types of Intrusions
+
+Identifying different types of intrusions is easy using an eye-test and visualizations. From the data visualization section, we already see obvious patterns of intrusions and different types as well. However, we would want a more scientific and generalized approach. 
+
+The difficulty of using cluster analysis for these data are that many clustering algorithms do not work well with mixed data types. The data provided by XYZ Bank were in continuous, nominal, and discrete formats. A cluster algorithm like Kmeans is not suitable.
+
+Instead, to get a distance metric that takes into account these nominal variables, we transform the data into distance metrics using gower distances.
+
+Gower distance works similar to a regression of factor variables. It turns a 3 factor nominal variable into 3 discrete binary variables. For example, our protocol type variable (icmp, tcp, udp) becomes three different variables of icmp, tcp, and udp, each specifying 1 for TRUE or 0 for FALSE.
+
+
+```{r}
+# Pull out intrusion data
+dataIntrusion <- filter(data, is_intrusion == "intrusion")
+
+# Select Variables important for clustering
+dataCluster <- dplyr::select(dataIntrusion, protocol_type, duration, service, flag,
+                             src_bytes, dst_bytes, hot, logged_in, num_compromised,
+                             root_shell, su_attempted, num_root, num_access_files, 
+                             is_guest_login, is_intrusion)
+
+
+gower_dist <- daisy(dataCluster[,1:15],
+                    metric = "gower")
+
+summary(gower_dist)
+
+```
+
+The dissimilarity metrics shown in the summary range from 0 to 1. This is how the gower distance transformation measures distance. We can actually use this distance to cluster.
+
+However, this distance metric does not work well with k-means algorithms. K-means only works well when measuring the squared Euclidean distance. Instead, we tried to use hierarchical clustering. This works far better with our distance measurement.
+
+```{r}
+cluster <- hclust(gower_dist, method = "complete")
+hcd <- as.dendrogram(cluster)
+
+plot(hcd)
+plot(cut(hcd, h = .2)$upper, main = "Upper tree of cut at h=.2")
+
+```
+
+The dendrogram produced by this hierarchical clustering is too big to see within this report. The second plot represents the upper branch of a cut at a dissimilarity of .2. It doesn't show the actual variables associated with the branch because of the gower transformation.
+
+The more difficult aspect with hierarhcial clustering is the analysis. Because we use a distance measurement with gower, it is difficult to understand each aspect of the clusters, regardless of cut.
+
+We decide to try another clustering algorithm called Partitioning around medoids.
+
+```{r}
+
+# PAM, using previously created gower distance
+sil_width <- c(NA)
+for(i in 2:15){
+  pam_fit <- pam(gower_dist,
+                 diss = TRUE,
+                 k = i)
+  sil_width[i] <- pam_fit$silinfo$avg.width
+}
+
+plot(1:15, sil_width,
+     xlab = "Number of clusters",
+     ylab = "Silhouette Width")
+lines(1:15, sil_width)
+```
+
+The plot shows that at around 6 clusters, we have the largest silhouette width. This width is a validation metric that compared how similar an observation is to its own cluster compared to the next closet cluster. Our assumption with this model is that there are roughly 6 different types of intrusions in our data. 
+
+```{r}
+
+pamFit <- pam(gower_dist, diss = TRUE, k = 6)
+
+resultsPAM <- dataCluster %>%
+  dplyr::select(-is_intrusion) %>%
+  mutate(cluster = pamFit$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+
+
+kable(dataCluster[pamFit$medoids, ])
+
+
+ggplot(dataCluster, aes(x = service, y = src_bytes, col = is_intrusion)) +
+  geom_point() +
+  labs(y = "Log SRC Bytes", x = "Service") +
+  geom_jitter() +
+  theme_bw()
+
+```
+
+This table provides a look at what clusters were created with the PAM algorithm. If we again look at the service to log src bytes plot, we can see the clusters present in the data. If we again look at a simple scatterplot with the ftp_data service, the table shows a clustering at 2.5 log src bytes and at 12.5 src bytes. The plot reveals those clusters to be accurate.
+
+
+``` {r}
+silPlot <- Rtsne(gower_dist, is_distance = TRUE)
+
+clusterPlot <- silPlot$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pamFit$clustering),
+         name = dataCluster$is_intrusion)
+
+ggplot(aes(x = X, y = Y), data = clusterPlot) +
+  geom_point(aes(color = cluster)) +
+  labs(title =  "t-SNE plot") +
+  theme_bw()
+
+```
+
+This plot represents the actual medoid placements on an x-y axis. We use a dimensional reduction technique called t-distributed stochastic neighborhood embedding to try and preserve the local structure and make it meaningful to understand. 
+
+That said, we actually see something interesting. It appears that there are 7 distinct types of intrusion events while our model suggested 6 as the optimal cluster number. 
+
+We've actually run this model a couple of times and that cluster usually remains. Our assumption is that those clusters represent some http intrusion that is assigned a heavy weight in the gower distance measurement. It's part of the quirk of dimensionality reduction. 
+
+There are concerns with this clustering, as we only had 300 intrusion points to compare. These clusters also wouldn't give good information about new types of attacks. However for our present data given by XYZ, we are able to differentiate between different types of intrusions. 
+
+
+# New Real Time Data
+
+To simulate real-time data, we reused the XYZ data provided and simply converted every continuous variable into a rate based on duration. Our assumption is that there are features that are known immediately when a connection is made. The service, the protocol type, the flag. Many discrete variables are immediately logged when the connection contact is first made. However, aspects such as src bytes and dst bytes can only be considered on rate basis until the connection is finished. 
+
+We get the rate by dividing the continuous features by total duration in every observation. We convert any feature that was originally 0 back into 0 afterwards.
+
+```{r}
+
+dataIncoming <- data
+dataIncoming[,c(5,6,8:11,13,16:20)] <- dataIncoming[,c(5,6,8:11,13,16:20)]/dataIncoming$duration
+dataIncoming[dataIncoming == "Inf"] <- 0
+dataIncoming[dataIncoming == "NaN"] <- 0
+
+gbmIncoming <- predict(gbmFit1, newdata = dataIncoming)
+print("Random Forest on Incoming Data Test")
+confusionMatrix(gbmIncoming, dataIncoming$is_intrusion, positive = "intrusion")
+```
+
+We tested this new simulated data on our boosted model and got mixed results. The GBM Model performs at roughly at 66% sensistiviy rate. There is a high rate of false negatives. My assumption is that our model learned that high src values are typically associated with intrusions. When switching to a rate, those src values are brought down heavily. 
+
+What might be a next step would be to modify the model to focus on a rate basis. If we have total connection time and a high src rate per unit of duration, that would give our model high power and be more robust to these real-time investigations. 
+
+
+# New Unseen Data
+
+Finally, in order to test our model's power in new and unseen ways, we managed to contact ABC bank who curiously had the similar formatted network logs (downloaded more from the UC Irvine KDD data). 
+
+The new data had much higher depth and quality than the XYZ data. It had more service levels, protocol types, and flag types. We removed all the nominal variables that didn't match with the XYZ dataset. We also decided to take a sample of 3000 observations just to make the comparisons consistent.
+
+```{r}
+# Unseen data preprocessing
+dataUnseen <- read.table("/Users/Alton/OneDrive/School/Data Mining/kddcup.data_10_percent_corrected", sep = ",")
+
+colnames(dataUnseen) = c("duration", "protocol_type", "service", "flag", "src_bytes", 
+                         "dst_bytes", "land", "wrong_fragment", "urgent", "hot", 
+                         "num_failed_logins", "logged_in", "num_compromised", "root_shell", 
+                         "su_attempted", "num_root", "num_file_creations",  "num_shells", 
+                         "num_access_files", "num_outbound_cmds", "is_hot_login","is_guest_login", 
+                         "count", "srv_count", "serror_rate", "srv_serror_rate", "rerror_rate",
+                         "srv_rerror_rate", "same_srv_rate", "diff_srv_rate", 
+                         "srv_diff_host_rate", "dst_host_count","dst_host_srv_count",
+                         "dst_host_same_srv_rate", "dst_host_diff_srv_rate", 
+                         "dst_host_same_src_port_rate", "dst_host_srv_diff_host_rate", 
+                         "dst_host_serror_rate","dst_host_srv_serror_rate", 
+                         "dst_host_rerror_rate", "dst_host_srv_rerror_rate", "is_intrusion")
+
+namelist <- names(data)
+dataUnseen <- dplyr::select(dataUnseen, namelist)
+
+flagList <- unique(data$flag)
+dataUnseen <- filter(dataUnseen, flag %in% flagList)
+serviceList <- unique(data$service)
+dataUnseen <- filter(dataUnseen, service %in% serviceList)
+dataUnseen$flag <- droplevels(dataUnseen$flag)
+dataUnseen$service <- droplevels(dataUnseen$service)
+
+dataUnseen$is_intrusion <- ifelse(dataUnseen$is_intrusion == "normal.", "benign", "intrusion")
+dataUnseen$is_intrusion <- as.factor(dataUnseen$is_intrusion)
+levels(dataUnseen$is_intrusion) <- c("benign", "intrusion")
+
+dataUnseen$src_bytes <- log(dataUnseen$src_bytes + 1)
+dataUnseen$dst_bytes <- log(dataUnseen$dst_bytes + 1)
+
+dataUnseen <- sample_n(dataUnseen, 3000)
+```
+
+
+```{r}
+print("Random Forest Model")
+rfUnseen <- predict(rfFit1, newdata = dataUnseen)
+confusionMatrix(rfUnseen, dataUnseen$is_intrusion, positive = "intrusion")
+
+print("Boosted Tree")
+gbmUnseen <- predict(gbmFit1, newdata = dataUnseen)
+confusionMatrix(gbmUnseen, dataUnseen$is_intrusion, positive = "intrusion")
+
+print("Linear Discriminat Analysis")
+ldaUnseen <- predict(ldaFit1, newdata = dataUnseen)
+confusionMatrix(ldaUnseen, dataUnseen$is_intrusion, positive = "intrusion")
+
+```
+
+When we test with our Random Forest model, we find that our performance is almost worse than guessing 50/50. We would have done far better just assuming each network connection was an intrusion. There is some voting decision within the tree that makes a large number of intrusions voted as benign. This is common for all the models we tested. Boosted forest is roughly as accurate as Random Forest.
+
+Our belief is that our model is very accurate at detecting intrusions of data it has seen before. The tree splits will nearly always bring an intrusion that it has encountered before to a correct classification. Yet this unseen data has new intrusion types that our models have not encountered.
+
+However, our LDA model performed extremely well. Referencing the variable importance plot, dst_bytes, logged_in and durations appears to be important considersations for this unseen data. The sensitivity is exactly in the range that we would hope. With the lower importance of false positives, the specificity doesn't bother us as much.
+
+The difference between the training/test data and the unseen data is obvious from a visualization standpoint. 
+
+```{r}
+ggplot(data, aes(x = service, y = src_bytes, col = is_intrusion)) +
+  geom_point() +
+  geom_jitter() +
+  labs(x = "Service", y = "Log Dst Bytes", title = "Train/Test Data") +
+  theme_bw()
+
+
+ggplot(dataUnseen, aes(x = service, y = src_bytes, col = is_intrusion)) +
+  geom_point() +
+  geom_jitter() +
+  labs(x = "Service", y = "Log Dst Bytes", title = "Unseen Data") +
+  theme_bw()
+
+```
+
+With these two plots, we can already see the difference between these new intrusion types and the old. 
+
+Particularly, around private and ecr_i services, the unseen data has a dramatic number of intrusions. Yet in our training data, ecr_i and private are all benign safe events. It's understandable that our tree would partition these into a benign class.
+
+
+
+# Findings
+	1. We successfully differentiated between labeled intrusions and benign sessions. We fit five different models and all performed well on the training and test data. The random forest was our preferred method. It performed well in all classification metrics compared to the other models.
+
+
+	2. We successfully differentiated between different types of intrusions. At the top level, service and flag were big indicators of different types of intrusions. Depending on the service type, a combination of high or low src bytes was indicative of different types of intrusions. 
+
+
+	3. Our test data and prediction showed that we were able to perform well on creating a system to detect new intrusions in log files. Unsuccessfully however, we were unable to detect the new intrusion patterns using our models.
+
+
+	4. Similar with task #3, when we received data from ABC bank that specified new types of attacks, our system did not achieve the type of power we had hoped. Using an LDA model, we were very succesful at capturing those new types of attacks, however our assumed 'best' classifers did not work as well. The tree models worked very well on problem intrusions that our model had seen before, but when the new attacks came, focused on a different pattern of service and protocol types, our modeling broke down and assumed it was benign. With the LDA, some features within the intrusions allowed it to be properly classified.
+
+
+  5. All the difficulties with new patterns none withstanding, our mode worked well at detecting intrusions in real time. With our simulation, we had fake rate data meant to simulate an ongoing connection, recording bytes at a rate per duration instead of a log file after the event. Our model performed well, although not perfectly. We understand that if we began training our model with both rate and total duration, we would find a lot more success in these real time events. 
